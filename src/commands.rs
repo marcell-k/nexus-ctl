@@ -27,6 +27,8 @@ if (-not $proc) {
 $targetPid = $proc.ProcessId
 Write-Host "[$Instance] PID $targetPid -- sending graceful stop signal (same as Ctrl+C)"
 
+$senderBody = @'
+param($TargetPid)
 Add-Type -Name NexusCtrlC -Namespace NexusCtl -MemberDefinition @"
 [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
 public static extern bool AttachConsole(uint dwProcessId);
@@ -37,13 +39,75 @@ public static extern bool SetConsoleCtrlHandler(IntPtr HandlerRoutine, bool Add)
 [System.Runtime.InteropServices.DllImport("kernel32.dll")]
 public static extern bool GenerateConsoleCtrlEvent(uint dwCtrlEvent, uint dwProcessGroupId);
 "@
-
 [NexusCtl.NexusCtrlC]::FreeConsole() | Out-Null
-[NexusCtl.NexusCtrlC]::AttachConsole([uint32]$targetPid) | Out-Null
+$attached = [NexusCtl.NexusCtrlC]::AttachConsole([uint32]$TargetPid)
+if (-not $attached) {
+    exit 1
+}
 [NexusCtl.NexusCtrlC]::SetConsoleCtrlHandler([IntPtr]::Zero, $true) | Out-Null
 [NexusCtl.NexusCtrlC]::GenerateConsoleCtrlEvent(0, 0) | Out-Null
 Start-Sleep -Milliseconds 500
 [NexusCtl.NexusCtrlC]::FreeConsole() | Out-Null
+exit 0
+'@
+$encodedSender = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($senderBody))
+
+# --- Attempt 1: direct, isolated child process ---------------------------
+$directProc = Start-Process -FilePath 'powershell.exe' `
+    -ArgumentList @('-NoProfile', '-EncodedCommand', $encodedSender, $targetPid) `
+    -WindowStyle Hidden -Wait -PassThru
+
+if ($directProc.ExitCode -eq 0) {
+    Write-Host "[$Instance] signal delivered directly."
+} else {
+    # --- Attempt 2: relay through a clone of the real task ---------------
+    # Same session/security context as $TaskName, so AttachConsole works.
+    Write-Host "[$Instance] direct delivery failed (exit $($directProc.ExitCode)) -- likely a different session (e.g. Session 0 for an unattended task). Relaying via a temporary scheduled task instead."
+
+    $senderTaskName = "NexusCtrlCSender-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+    try {
+        [xml]$taskXml = Export-ScheduledTask -TaskName $TaskName
+        $ns = New-Object System.Xml.XmlNamespaceManager($taskXml.NameTable)
+        $ns.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
+        $nsUri = $ns.LookupNamespace('t')
+
+        $actionsNode = $taskXml.SelectSingleNode('//t:Actions', $ns)
+        $actionsNode.RemoveAll()
+        $execNode = $taskXml.CreateElement('Exec', $nsUri)
+        $cmdNode = $taskXml.CreateElement('Command', $nsUri)
+        $cmdNode.InnerText = 'powershell.exe'
+        $argNode = $taskXml.CreateElement('Arguments', $nsUri)
+        $argNode.InnerText = "-NoProfile -WindowStyle Hidden -EncodedCommand $encodedSender $targetPid"
+        $execNode.AppendChild($cmdNode) | Out-Null
+        $execNode.AppendChild($argNode) | Out-Null
+        $actionsNode.AppendChild($execNode) | Out-Null
+
+        $triggersNode = $taskXml.SelectSingleNode('//t:Triggers', $ns)
+        $triggersNode.RemoveAll()
+        $timeTrigger = $taskXml.CreateElement('TimeTrigger', $nsUri)
+        $startNode = $taskXml.CreateElement('StartBoundary', $nsUri)
+        $startNode.InnerText = (Get-Date).AddSeconds(2).ToString('yyyy-MM-ddTHH:mm:ss')
+        $timeTrigger.AppendChild($startNode) | Out-Null
+        $triggersNode.AppendChild($timeTrigger) | Out-Null
+
+        Register-ScheduledTask -TaskName $senderTaskName -Xml $taskXml.OuterXml -Force | Out-Null
+        Start-ScheduledTask -TaskName $senderTaskName
+
+        $relayDeadline = (Get-Date).AddSeconds(15)
+        do {
+            Start-Sleep -Milliseconds 500
+            $info = Get-ScheduledTask -TaskName $senderTaskName -ErrorAction SilentlyContinue
+        } while ($info -and $info.State -eq 'Running' -and (Get-Date) -lt $relayDeadline)
+
+        $result = (Get-ScheduledTaskInfo -TaskName $senderTaskName -ErrorAction SilentlyContinue).LastTaskResult
+        Write-Host "[$Instance] relay task finished (result: $result)."
+    } catch {
+        Write-Host "[$Instance] WARNING: relay via scheduled task failed: $_"
+        Write-Host "[$Instance] WARNING: this usually means the task uses a stored-password logon and Register-ScheduledTask needs -User/-Password to recreate it -- check the task's 'Run whether user is logged on or not' credentials in Task Scheduler."
+    } finally {
+        Unregister-ScheduledTask -TaskName $senderTaskName -Confirm:$false -ErrorAction SilentlyContinue
+    }
+}
 
 Write-Host "[$Instance] waiting up to $GraceSeconds second(s) for a clean shutdown..."
 $deadline = (Get-Date).AddSeconds($GraceSeconds)
