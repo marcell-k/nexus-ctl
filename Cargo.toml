@@ -1,0 +1,16 @@
+[package]
+name = "nexus-ctl"
+version = "0.1.0"
+edition = "2021"
+description = "Remote control CLI for nexus-trade Scheduled Tasks on a Windows box, over Tailscale SSH."
+
+[[bin]]
+name = "nexus-ctl"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "=4.4.18", features = ["derive"] }
+anyhow = "=1.0.86"
+
+[profile.release]
+opt-level = 2
