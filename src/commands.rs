@@ -2,7 +2,14 @@ use std::io::Write;
 use std::process::{exit, Command, Stdio};
 
 use anyhow::{bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Subcommand, ValueEnum};
+
+fn base64_decode(s: &str) -> Result<Vec<u8>> {
+    STANDARD
+        .decode(s)
+        .context("invalid base64 from remote script")
+}
 
 const GRACEFUL_STOP_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
@@ -218,38 +225,139 @@ pub fn cmd_logs_tail(env: Env, lines: u32, dry_run: bool) -> Result<()> {
     )
 }
 
-pub fn cmd_logs_pull(env: Env, dest: String, use_rsync: bool, dry_run: bool) -> Result<()> {
-    let dest = shellexpand_home(&dest);
-    if !dry_run {
-        std::fs::create_dir_all(&dest)
-            .with_context(|| format!("failed to create destination dir {dest}"))?;
+pub fn cmd_logs_pull(env: Env, _dest: String, _use_rsync: bool, dry_run: bool) -> Result<()> {
+    let dest_base = "/Users/marci/Trading/logs";
+
+    if dry_run {
+        println!(
+            "[dry-run] ssh {} -- powershell script to copy shared logs -> extract to {dest_base}",
+            crate::host()
+        );
+        return Ok(());
     }
 
-    if use_rsync {
-        let remote = format!(
-            "{}:{}/logs/",
-            crate::host(),
-            to_forward_slashes(&crate::remote_project())
+    let instances = env.instances();
+    println!(
+        "==> pulling logs for {:?} (handling locked files) -> {dest_base}",
+        instances
+    );
+
+    let filter_items = instances
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let ps_filter = format!("@({filter_items})");
+
+    let ps_script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$targetInstances = {ps_filter}
+$tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString())
+$tempZip = [System.IO.Path]::GetTempFileName() + '.zip'
+
+New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+
+Get-ChildItem -Path '{}\logs' -Recurse -File | ForEach-Object {{
+    $file = $_
+    $matchesFilter = $false
+    foreach ($inst in $targetInstances) {{
+        if ($file.Name -like "*$inst*" -or $file.DirectoryName -like "*$inst*") {{
+            $matchesFilter = $true
+            break
+        }}
+    }}
+
+    if ($matchesFilter) {{
+        $relPath = $file.FullName.Substring('{}\logs'.Length).TrimStart('\')
+        $targetFile = Join-Path $tempDir $relPath
+        $targetFolder = [System.IO.Path]::GetDirectoryName($targetFile)
+
+        if (-not (Test-Path $targetFolder)) {{
+            New-Item -ItemType Directory -Path $targetFolder -Force | Out-Null
+        }}
+
+        $srcStream = [System.IO.File]::Open($file.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $destStream = [System.IO.File]::Create($targetFile)
+        $srcStream.CopyTo($destStream)
+        $srcStream.Close()
+        $destStream.Close()
+    }}
+}}
+
+if ((Get-ChildItem -Path $tempDir -Recurse -File).Count -eq 0) {{
+    Write-Error "No matching log files found on remote host."
+    exit 1
+}}
+
+Compress-Archive -Path "$tempDir\*" -DestinationPath $tempZip -Force
+$bytes = [System.IO.File]::ReadAllBytes($tempZip)
+[Convert]::ToBase64String($bytes)
+
+Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item $tempZip -Force -ErrorAction SilentlyContinue
+"#,
+        crate::remote_project(),
+        crate::remote_project()
+    );
+
+    let mut child = Command::new("ssh")
+        .arg(crate::host())
+        .arg("powershell -NoProfile -Command -")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn ssh process")?;
+
+    child
+        .stdin
+        .take()
+        .expect("stdin handle lost")
+        .write_all(ps_script.as_bytes())
+        .context("failed to write script to stdin")?;
+
+    let output = child.wait_with_output().context("failed waiting on ssh")?;
+
+    if !output.status.success() {
+        bail!(
+            "failed to archive logs on remote host: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
-        println!("==> rsync logs -> {dest}");
-        run_local(
-            "rsync",
-            &["-avz".to_string(), remote, format!("{dest}/")],
-            dry_run,
-        )
-    } else {
-        for inst in env.instances() {
-            let remote = format!(
-                "{}:{}/logs/{}.log",
-                crate::host(),
-                to_forward_slashes(&crate::remote_project()),
-                inst
-            );
-            println!("==> scp {inst}.log -> {dest}");
-            run_local("scp", &[remote, format!("{dest}/")], dry_run)?;
-        }
-        Ok(())
     }
+
+    // stdout is a base64 string (PowerShell may add trailing newline/whitespace).
+    let b64 = String::from_utf8_lossy(&output.stdout);
+    let b64 = b64.trim();
+    if b64.is_empty() {
+        bail!(
+            "remote script produced no output — stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let zip_bytes = base64_decode(b64).context("failed to decode base64 zip data from remote")?;
+
+    let temp_zip_path = std::env::temp_dir().join("nexus_logs_temp.zip");
+    std::fs::write(&temp_zip_path, &zip_bytes)
+        .context("failed to save temporary zip file locally")?;
+
+    std::fs::create_dir_all(dest_base)?;
+    let status = Command::new("unzip")
+        .arg("-o")
+        .arg(&temp_zip_path)
+        .arg("-d")
+        .arg(dest_base)
+        .status()
+        .context("failed to run local `unzip` utility")?;
+
+    let _ = std::fs::remove_file(temp_zip_path);
+
+    if !status.success() {
+        bail!("failed to extract log files into {dest_base}");
+    }
+
+    println!("==> successfully updated logs in {dest_base}");
+    Ok(())
 }
 
 pub fn cmd_shell(dry_run: bool) -> Result<()> {
@@ -347,33 +455,4 @@ fn run_remote_script(script: &str, dry_run: bool) -> Result<()> {
 
 fn ps_single_quote(s: &str) -> String {
     s.replace('\'', "''")
-}
-
-fn run_local(program: &str, args: &[String], dry_run: bool) -> Result<()> {
-    if dry_run {
-        println!("[dry-run] {} {}", program, args.join(" "));
-        return Ok(());
-    }
-
-    let status = Command::new(program).args(args).status().with_context(|| {
-        format!("failed to spawn `{program}` — is it installed and on your PATH?")
-    })?;
-
-    if !status.success() {
-        bail!("{} exited with status {:?}", program, status.code());
-    }
-    Ok(())
-}
-
-fn to_forward_slashes(windows_path: &str) -> String {
-    windows_path.replace('\\', "/")
-}
-
-fn shellexpand_home(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
-        }
-    }
-    path.to_string()
 }
