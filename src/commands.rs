@@ -25,23 +25,47 @@ if (-not $proc) {
 }
 
 $targetPid = $proc.ProcessId
-$stopFile = Join-Path $RemoteProject ".stop.$Instance"
-Write-Host "[$Instance] PID $targetPid -- writing stop file: $stopFile"
-New-Item -ItemType File -Path $stopFile -Force | Out-Null
+
+Add-Type -Name Win32CtrlC -Namespace NexusCtl -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool AttachConsole(uint dwProcessId);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool FreeConsole();
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool SetConsoleCtrlHandler(IntPtr HandlerRoutine, bool Add);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GenerateConsoleCtrlEvent(uint dwCtrlEvent, uint dwProcessGroupId);
+'@
+
+[void][NexusCtl.Win32CtrlC]::FreeConsole()
+if (-not [NexusCtl.Win32CtrlC]::AttachConsole([uint32]$targetPid)) {
+    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    Write-Host "[$Instance] WARNING: AttachConsole failed (err=$err) -- target has no console, can't send CTRL_C. Force-killing."
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue
+    exit 1
+}
+
+Write-Host "[$Instance] PID $targetPid -- sending CTRL_C"
+[void][NexusCtl.Win32CtrlC]::SetConsoleCtrlHandler([IntPtr]::Zero, $true)   # ignore CTRL_C in this shell too
+[void][NexusCtl.Win32CtrlC]::GenerateConsoleCtrlEvent(0, 0)                # 0 = CTRL_C_EVENT, group 0 = whole console
+Start-Sleep -Milliseconds 500
+[void][NexusCtl.Win32CtrlC]::FreeConsole()
+[void][NexusCtl.Win32CtrlC]::SetConsoleCtrlHandler([IntPtr]::Zero, $false)
+
 Write-Host "[$Instance] waiting up to $GraceSeconds second(s) for a clean shutdown..."
 $deadline = (Get-Date).AddSeconds($GraceSeconds)
 while ((Get-Date) -lt $deadline) {
     if (-not (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)) {
         Write-Host "[$Instance] exited cleanly."
         Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        Remove-Item $stopFile -Force -ErrorAction SilentlyContinue
         exit 0
     }
     Start-Sleep -Seconds 2
 }
 
 Write-Host "[$Instance] WARNING: still running after $GraceSeconds second(s) -- force-killing the whole process tree now."
-Write-Host "[$Instance] WARNING: it did not get to run its own shutdown logic -- verify open positions manually."
+Write-Host "[$Instance] WARNING: CTRL_C was sent but app didn't exit in time -- verify open positions manually."
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 $cmdProc = Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" |
     Where-Object { $_.CommandLine -like "*run-$Instance*" } |
@@ -54,10 +78,7 @@ if ($cmdProc) {
     Write-Host "[$Instance] could not locate parent cmd.exe -- falling back to killing uv.exe PID only"
     Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue
 }
-
-Remove-Item $stopFile -Force -ErrorAction SilentlyContinue
 "#;
-
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
 pub enum Env {
     Ictrading,
@@ -86,7 +107,7 @@ pub enum Commands {
         #[arg(value_enum, default_value_t = Env::All)]
         env: Env,
 
-        #[arg(long, default_value_t = 60)]
+        #[arg(long, default_value_t = 70)]
         grace: u32,
 
         #[arg(long)]
@@ -94,7 +115,6 @@ pub enum Commands {
     },
 
     Status,
-    Kill,
     Logs {
         #[command(subcommand)]
         action: LogsAction,
@@ -128,10 +148,7 @@ pub fn cmd_start(env: Env, dry_run: bool) -> Result<()> {
     for inst in env.instances() {
         println!("==> starting {inst}");
         run_remote(
-            &ps(format!(
-                "Start-ScheduledTask -TaskName '{}'",
-                task_name(inst)
-            )),
+            &format!("Start-ScheduledTask -TaskName '{}'", task_name(inst)),
             dry_run,
         )?;
     }
@@ -143,14 +160,14 @@ pub fn cmd_stop(env: Env, grace: u32, force: bool, dry_run: bool) -> Result<()> 
         if force {
             println!("==> force-stopping {inst} immediately (no grace period — it will NOT close positions)");
             run_remote(
-                &ps(format!(
+                &format!(
                     "Stop-ScheduledTask -TaskName '{}'; \
-                     Get-CimInstance Win32_Process -Filter \"Name='uv.exe'\" | \
-                     Where-Object {{ $_.CommandLine -like '*.env.{}*' }} | \
-                     ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}",
+         Get-CimInstance Win32_Process -Filter \"Name='uv.exe'\" | \
+         Where-Object {{ $_.CommandLine -like '*.env.{}*' }} | \
+         ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}",
                     task_name(inst),
                     inst
-                )),
+                ),
                 dry_run,
             )?;
             continue;
@@ -181,23 +198,17 @@ pub fn cmd_status(dry_run: bool) -> Result<()> {
     cmd_parts.push(
         "Get-Process uv -ErrorAction SilentlyContinue | Select-Object Id, StartTime".to_string(),
     );
-    run_remote(&ps(cmd_parts.join("; ")), dry_run)
-}
-
-pub fn cmd_kill(dry_run: bool) -> Result<()> {
-    run_remote(
-        &ps("Get-Process uv -ErrorAction SilentlyContinue | Stop-Process -Force"),
-        dry_run,
-    )
+    run_remote(&cmd_parts.join("; "), dry_run)
 }
 
 pub fn cmd_processes(dry_run: bool) -> Result<()> {
     run_remote(
-        &ps("Get-Process uv,nexus-trade,python -ErrorAction SilentlyContinue"),
+        "Get-CimInstance Win32_Process -Filter \"Name='uv.exe' or Name='cmd.exe'\" | \
+         Where-Object { $_.CommandLine -like '*nexus-trade*' } | \
+         Select-Object ProcessId, Name, CommandLine | Format-Table -AutoSize",
         dry_run,
     )
 }
-
 pub fn cmd_logs_tail(env: Env, lines: u32, dry_run: bool) -> Result<()> {
     let insts = env.instances();
     if insts.len() > 1 {
@@ -206,11 +217,7 @@ pub fn cmd_logs_tail(env: Env, lines: u32, dry_run: bool) -> Result<()> {
     let inst = insts[0];
     println!("==> tailing {inst} (Ctrl+C to stop; the task keeps running)");
     run_remote(
-        &ps(format!(
-            "Get-Content '{}' -Wait -Tail {}",
-            log_path(inst),
-            lines
-        )),
+        &format!("Get-Content '{}' -Wait -Tail {}", log_path(inst), lines),
         dry_run,
     )
 }
@@ -241,6 +248,7 @@ pub fn cmd_logs_pull(env: Env, _dest: String, _use_rsync: bool, dry_run: bool) -
 
     let ps_script = format!(
         r#"
+$ProgressPreference = 'SilentlyContinue'
 $ErrorActionPreference = 'Stop'
 $targetInstances = {ps_filter}
 $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString())
@@ -292,6 +300,8 @@ Remove-Item $tempZip -Force -ErrorAction SilentlyContinue
     );
 
     let mut child = Command::new("ssh")
+        .arg("-o")
+        .arg("LogLevel=ERROR")
         .arg(crate::host())
         .arg("powershell -NoProfile -Command -")
         .stdin(Stdio::piped())
@@ -356,6 +366,8 @@ pub fn cmd_shell(dry_run: bool) -> Result<()> {
         return Ok(());
     }
     let status = Command::new("ssh")
+        .arg("-o")
+        .arg("LogLevel=ERROR")
         .arg(crate::host())
         .status()
         .context("failed to spawn `ssh` ")?;
@@ -373,16 +385,21 @@ fn log_path(instance: &str) -> String {
     format!(r"{}\logs\{}.log", crate::remote_project(), instance)
 }
 
-fn run_remote(ps_command: &str, dry_run: bool) -> Result<()> {
+fn run_remote(ps_script: &str, dry_run: bool) -> Result<()> {
     if dry_run {
-        println!("[dry-run] ssh {} -- {}", crate::host(), ps_command);
+        println!(
+            "[dry-run] ssh {} -- powershell -EncodedCommand <base64> for:\n{}",
+            crate::host(),
+            ps_script
+        );
         return Ok(());
     }
 
     let status = Command::new("ssh")
-        .arg("-t")
+        .arg("-o")
+        .arg("LogLevel=ERROR")
         .arg(crate::host())
-        .arg(ps_command)
+        .arg(ps_encoded(ps_script))
         .status()
         .context("failed to spawn `ssh` — is it installed and on your PATH?")?;
 
@@ -398,10 +415,12 @@ fn run_remote(ps_command: &str, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn ps(cmd: impl Into<String>) -> String {
+fn ps_encoded(script: &str) -> String {
+    let full = format!("$ProgressPreference = 'SilentlyContinue'\n{script}");
+    let utf16_bytes: Vec<u8> = full.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     format!(
-        "powershell -NoProfile -Command \"{}\"",
-        cmd.into().replace('"', "`\"")
+        "powershell -NoProfile -EncodedCommand {}",
+        STANDARD.encode(utf16_bytes)
     )
 }
 
@@ -417,6 +436,8 @@ fn run_remote_script(script: &str, dry_run: bool) -> Result<()> {
     }
 
     let mut child = Command::new("ssh")
+        .arg("-o")
+        .arg("LogLevel=ERROR")
         .arg(crate::host())
         .arg("powershell -NoProfile -Command -")
         .stdin(Stdio::piped())

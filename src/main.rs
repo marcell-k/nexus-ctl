@@ -4,8 +4,8 @@ use std::process::exit;
 
 use clap::Parser;
 use commands::{
-    cmd_kill, cmd_logs_pull, cmd_logs_tail, cmd_processes, cmd_shell, cmd_start, cmd_status,
-    cmd_stop, Commands, LogsAction,
+    cmd_logs_pull, cmd_logs_tail, cmd_processes, cmd_shell, cmd_start, cmd_status, cmd_stop,
+    Commands, LogsAction,
 };
 
 const DEFAULT_HOST: &str = "Marci@windows.tail0212d0.ts.net";
@@ -72,7 +72,6 @@ fn main() {
         Commands::Start { env } => cmd_start(env, cli.dry_run),
         Commands::Stop { env, grace, force } => cmd_stop(env, grace, force, cli.dry_run),
         Commands::Status => cmd_status(cli.dry_run),
-        Commands::Kill => cmd_kill(cli.dry_run),
         Commands::Logs { action } => match action {
             LogsAction::Tail { env, lines } => cmd_logs_tail(env, lines, cli.dry_run),
             LogsAction::Pull { env, dest, rsync } => cmd_logs_pull(env, dest, rsync, cli.dry_run),
