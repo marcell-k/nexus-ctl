@@ -4,7 +4,7 @@ use std::process::exit;
 
 use clap::Parser;
 use commands::{
-    cmd_kill, cmd_logs_pull, cmd_logs_tail, cmd_restart, cmd_shell, cmd_start, cmd_status,
+    cmd_kill, cmd_logs_pull, cmd_logs_tail, cmd_processes, cmd_shell, cmd_start, cmd_status,
     cmd_stop, Commands, LogsAction,
 };
 
@@ -71,7 +71,6 @@ fn main() {
     let result = match cli.command {
         Commands::Start { env } => cmd_start(env, cli.dry_run),
         Commands::Stop { env, grace, force } => cmd_stop(env, grace, force, cli.dry_run),
-        Commands::Restart { env, grace } => cmd_restart(env, grace, cli.dry_run),
         Commands::Status => cmd_status(cli.dry_run),
         Commands::Kill => cmd_kill(cli.dry_run),
         Commands::Logs { action } => match action {
@@ -79,6 +78,7 @@ fn main() {
             LogsAction::Pull { env, dest, rsync } => cmd_logs_pull(env, dest, rsync, cli.dry_run),
         },
         Commands::Shell => cmd_shell(cli.dry_run),
+        Commands::Processes => cmd_processes(cli.dry_run),
     };
 
     if let Err(e) = result {
